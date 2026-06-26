@@ -1,10 +1,12 @@
-import { Router } from 'express';
-import { drive_v3, google } from 'googleapis';
-import fs from 'fs';
-import { CustomRequest, EMAIL_PASSWORD, EMAIL_USERNAME, generateUniqueId, Messages, StatusCodes } from '../config';
+import { Router, Request, Response, NextFunction } from 'express';
+import { CustomRequest, EMAIL_USERNAME, generateUniqueId, Messages, StatusCodes } from '../config';
 import accessManagerModel from '../model/accessManagerModel';
 import { authenticateJWT } from '../controller/authController';
-import nodemailer from 'nodemailer';
+import {
+    getDriveClient,
+    getMailTransporter,
+    isGoogleDriveConfigured,
+} from '../utilities/googleDrive';
 
 
 const router = Router();
@@ -14,34 +16,22 @@ interface IFile {
     webViewLink?: string;
 }
 
-// Load service account credentials
-const credentials = JSON.parse(fs.readFileSync('service-account.json', 'utf8'));
-
-// Configure Google Drive API
-const auth = new google.auth.JWT(
-    credentials.client_email,
-    undefined,
-    credentials.private_key,
-    ['https://www.googleapis.com/auth/drive'] // Scope for full Drive access
-);
-
-const transporter = nodemailer.createTransport({
-    service: 'gmail', 
-    auth: {
-        user: "nitinkvishvakarma@gmail.com", 
-        pass: "bkfr kaft vdds oyru"
+const requireDrive = (_req: Request, res: Response, next: NextFunction) => {
+    if (!isGoogleDriveConfigured()) {
+        return res.status(StatusCodes.SERVICE_UNAVAILABLE).json({
+            message: "Google Drive integration is not configured on this server.",
+        });
     }
-});
-
-const drive = google.drive({ version: 'v3', auth });
-// console.log("drive ==> ",drive);
+    next();
+};
 
 router.use(authenticateJWT);
 
 // Route to fetch folders
-router.get('/folders', async (req, res) => {
+router.get('/folders', requireDrive, async (req, res) => {
     try {
         console.log("Inside of /folders ==> ");
+        const drive = getDriveClient();
         const response = await drive.files.list({
             q: "mimeType='application/vnd.google-apps.folder'",
             fields: 'files(id, name)',
@@ -113,7 +103,7 @@ router.get('/folders', async (req, res) => {
 // });
 
 
-router.post('/remove-access', async (req: CustomRequest, res) => {
+router.post('/remove-access', requireDrive, async (req: CustomRequest, res) => {
     const { folderId, folderName, userEmails, users } = req.body;
     if (!req.payload) {
         return res.status(StatusCodes.UNAUTHORIZED).json({ message: Messages.PAYLOAD_MISSING_OR_INVALID, });
@@ -122,6 +112,8 @@ router.post('/remove-access', async (req: CustomRequest, res) => {
 
     console.log("req.body ==> ", req.body)
     try {
+        const drive = getDriveClient();
+        const transporter = getMailTransporter();
         const permissions: any = await drive.permissions.list({
             fileId: folderId,
             fields: 'permissions(id, emailAddress)',
@@ -163,10 +155,11 @@ router.post('/remove-access', async (req: CustomRequest, res) => {
             console.log("Access Removed !");
 
             // Send email notification to each user
-            const emailPromises = userEmails.map((email: string) => {
-                const mailOptions = {
-                    from: 'nitin.vishvakarma@vectedtech.com',
-                    to: email,
+            if (transporter) {
+                const emailPromises = userEmails.map((email: string) => {
+                    const mailOptions = {
+                        from: EMAIL_USERNAME || 'operations@vectorskillacademy.com',
+                        to: email,
                     subject: 'Action Required: Class Access Revoked Due to Uninformed Absence',
                     html: `
                         <div style="font-family: Arial, sans-serif; line-height: 1.6; max-width: 600px; margin: 0 auto;">
@@ -189,12 +182,17 @@ router.post('/remove-access', async (req: CustomRequest, res) => {
                     `
                 };
 
-                return transporter.sendMail(mailOptions);
+                    return transporter.sendMail(mailOptions);
+                });
+
+                await Promise.all(emailPromises);
+            }
+
+            res.status(StatusCodes.CREATED).json({
+                message: transporter
+                    ? 'Removed access for users and notifications sent'
+                    : 'Removed access for users',
             });
-
-            await Promise.all(emailPromises);
-
-            res.status(StatusCodes.CREATED).json({ message: 'Removed access for users and notifications sent' });
         }
 
     } catch (error) {
@@ -203,7 +201,7 @@ router.post('/remove-access', async (req: CustomRequest, res) => {
     }
 });
 
-router.get('/folder-members', async (req, res) => {
+router.get('/folder-members', requireDrive, async (req, res) => {
     const { folderId } = req.query;
     // Ensure folderId is a string
     if (typeof folderId !== 'string') {
@@ -211,7 +209,7 @@ router.get('/folder-members', async (req, res) => {
     }
 
     try {
-        const drive: drive_v3.Drive = google.drive({ version: 'v3', auth });
+        const drive = getDriveClient();
 
         // Fetch permissions for the folder
         const result = await drive.permissions.list({
@@ -319,13 +317,15 @@ router.get('/folder-members', async (req, res) => {
 //     }
 // });
 
-router.post("/provide-access", async (req: CustomRequest, res) => {
+router.post("/provide-access", requireDrive, async (req: CustomRequest, res) => {
     try {
         const { folderId, folderName, users, role, accessExpiresTime: expirationDate } = req?.body;
         if (!req.payload) {
             return res.status(StatusCodes.UNAUTHORIZED).json({ message: Messages.PAYLOAD_MISSING_OR_INVALID, });
         }
         const { userId: adminId, roleName } = req.payload;
+        const drive = getDriveClient();
+        const transporter = getMailTransporter();
 
         console.log("req?.body inside access provider ==> ", req.body);
 
@@ -385,11 +385,11 @@ router.post("/provide-access", async (req: CustomRequest, res) => {
         const result = await accessManagerModel.create(data);
 
         if (result) {
-            // ========== ADDED EMAIL NOTIFICATION LOGIC ==========
-            const emailPromises = users.map(async (email: string) => {
-                const mailOptions = {
-                    from: 'operations@vectorskillacademy.com',
-                    to: email,
+            if (transporter) {
+                const emailPromises = users.map(async (email: string) => {
+                    const mailOptions = {
+                        from: EMAIL_USERNAME || 'operations@vectorskillacademy.com',
+                        to: email,
                     subject: `Access Granted: ${folderName}`,
                     html: `
                         <div style="font-family: Arial, sans-serif; line-height: 1.6; max-width: 600px; margin: 0 auto;">
@@ -417,9 +417,10 @@ router.post("/provide-access", async (req: CustomRequest, res) => {
                 } catch (emailError) {
                     console.error(`Failed to send email to ${email}:`, emailError);
                 }
-            });
+                });
 
-            await Promise.all(emailPromises);
+                await Promise.all(emailPromises);
+            }
 
             console.log("All permissions processed and notifications sent");
             res.status(200).json({ message: 'Access provided successfully' });
@@ -431,9 +432,10 @@ router.post("/provide-access", async (req: CustomRequest, res) => {
     }
 });
 
-router.get("/list-users", async (req: any, res: any) => {
+router.get("/list-users", requireDrive, async (req: any, res: any) => {
     try {
         const folderId = req.query.folderId; // Correctly extract folderId from query parameters
+        const drive = getDriveClient();
 
         // Check if folderId exists
         console.log("folderId ==> ", folderId);
@@ -459,7 +461,7 @@ router.get("/list-users", async (req: any, res: any) => {
     }
 });
 
-router.get('/getFolders', async (req, res) => {
+router.get('/getFolders', requireDrive, async (req, res) => {
     const { email } = req.body;
 
     try {
@@ -525,6 +527,7 @@ router.get("/access-logs", async (req, res) => {
 
 const getFoldersWithAccess = async (email: string): Promise<number> => {
     try {
+        const drive = getDriveClient();
 
         const response = await drive.files.list({
             q: "mimeType='application/vnd.google-apps.folder'",
@@ -562,7 +565,7 @@ const getFoldersWithAccess = async (email: string): Promise<number> => {
 };
 
 // Add to server.ts
-router.get('/documents', async (req: Request, res: any) => {
+router.get('/documents', requireDrive, async (req: Request, res: any) => {
     try {
         // Validate environment variable
         console.log("Inside /documents api ")
@@ -570,6 +573,8 @@ router.get('/documents', async (req: Request, res: any) => {
         if (!folderId) {
             return res.status(400).json({ error: 'Google Drive folder ID not configured' });
         }
+
+        const drive = getDriveClient();
 
         // Get files from Google Drive
         const response = await drive.files.list({
@@ -594,8 +599,9 @@ router.get('/documents', async (req: Request, res: any) => {
     }
 });
 
-router.get('/recordings', async (req: Request, res: any) => {
+router.get('/recordings', requireDrive, async (req: Request, res: any) => {
     try {
+        const drive = getDriveClient();
         // Real implementation
         const response = await drive.files.list({
             q: `'190aMgS36bSlVX20tppcf5vkbiKc5fg0L' in parents`,

@@ -1,0 +1,91 @@
+name: Auto Tag and Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Configure GitHub SSH access
+      - name: Setup GitHub SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_ed25519_github2
+          chmod 600 ~/.ssh/id_ed25519_github2
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global core.sshCommand "ssh -i ~/.ssh/id_ed25519_github2 -o IdentitiesOnly=yes"
+      # 2. Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.SSH_DEPLOY_KEY }}
+
+      # 3. Create and push tag
+      - name: Create and push tag
+        id: tagging
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git fetch --tags
+          # Get the latest tag or fallback to v1.0.0
+          LAST_TAG=$(git tag --sort=-v:refname | head -n 1)
+          echo "Latest tag: $LAST_TAG"
+          if [[ "$LAST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+          else
+            MAJOR=1
+            MINOR=0
+            PATCH=0
+          fi
+          # Increment patch version
+          NEW_TAG="v$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "New tag to push: $NEW_TAG"
+          git tag -a "$NEW_TAG" -m "Auto-deploy $NEW_TAG"
+          git push origin "$NEW_TAG"
+          echo "new_tag=${NEW_TAG}" >> $GITHUB_OUTPUT
+      # 4. Verify tag output
+
+      # 5. Setup VM connection
+      - name: Setup VM SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/vm_key
+          chmod 600 ~/.ssh/vm_key
+          ssh-keyscan ${{ secrets.VM_IP }} >> ~/.ssh/known_hosts
+      # 6. Debug environment
+      - name: Verify Remote Setup
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+              -i ~/.ssh/vm_key \
+              azureuser@${{ secrets.VM_IP }} \
+              "echo 'Current dir: $(pwd)'; \
+               echo 'Script contents:'; \
+               ls -la ~/scripts/; \
+               echo 'First 5 lines:'; \
+               head -5 ~/scripts/deploy_crm_backend.sh"
+      # 7. Final deployment
+      - name: Deploy to Production
+        run: |
+          # Store the tag in a variable
+          TAG="${{ steps.tagging.outputs.new_tag }}"
+          
+          # Debug output
+          echo "DEPLOYMENT DEBUG:"
+          echo "Tag being passed: $TAG"
+          echo "VM IP: ${{ secrets.VM_IP }}"
+          
+          # Execute with proper argument passing
+          ssh -o StrictHostKeyChecking=no \
+              -i ~/.ssh/vm_key \
+              azureuser@${{ secrets.VM_IP }} \
+              "cd ~ && \
+              echo 'Current directory: \$(pwd)' && \
+              echo 'Script exists: \$(ls -la ./scripts/deploy_support_backend.sh)' && \
+              echo 'Tag being used: $TAG' && \
+              /bin/bash ./scripts/deploy_support_backend.sh '$TAG'"
+              
